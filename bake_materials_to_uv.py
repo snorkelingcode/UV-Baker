@@ -136,6 +136,26 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
         if original_engine != 'CYCLES':
             scene.render.engine = 'CYCLES'
 
+        # Force GPU rendering for bake performance
+        original_device = scene.cycles.device
+        original_compute_type = None
+        cycles_prefs = context.preferences.addons['cycles'].preferences
+        original_compute_type = cycles_prefs.compute_device_type
+        # Try GPU backends in order of preference
+        gpu_activated = False
+        for backend in ('OPTIX', 'HIP', 'ONEAPI', 'METAL', 'CUDA'):
+            if backend in {t.value for t in cycles_prefs.get_device_type_items()}:
+                cycles_prefs.compute_device_type = backend
+                cycles_prefs.get_devices()
+                for device in cycles_prefs.devices:
+                    device.use = True
+                scene.cycles.device = 'GPU'
+                gpu_activated = True
+                break
+        if not gpu_activated:
+            # No GPU available, fall back to CPU
+            scene.cycles.device = 'CPU'
+
         # Create one bake target image per map
         bake_images = {}
         for map_name in ('color', 'roughness', 'normal', 'metallic'):
@@ -192,6 +212,10 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
 
         finally:
             wm.progress_end()
+            # Restore original render device settings
+            scene.cycles.device = original_device
+            if original_compute_type is not None:
+                cycles_prefs.compute_device_type = original_compute_type
             scene.render.engine = original_engine
             if obj.mode != original_mode:
                 bpy.ops.object.mode_set(mode=original_mode)
