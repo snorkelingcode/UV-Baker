@@ -15,11 +15,11 @@ from bpy.props import (
 
 bl_info = {
     "name": "Bake Materials to UV",
-    "author": "",
+    "author": "Embody AI",
     "version": (1, 0, 0),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Object Context Menu",
-    "description": "Bake PBR material channels (Color, Metallic, Roughness, Normal) to image textures on disk",
+    "description": "Bake PBR material channels (Color, Metallic, Roughness, Normal) to UV map then save image textures on disk",
     "category": "Object",
 }
 
@@ -31,13 +31,21 @@ def get_image_items(self, context):
     global _image_enum_items
     items = []
     for img in bpy.data.images:
-        if img.size[0] > 0 and img.size[1] > 0:
-            if img.name in {'Render Result', 'Viewer Node'}:
-                continue
-            if img.name.startswith('_bake_'):
-                continue
-            label = f"{img.name} ({img.size[0]}x{img.size[1]})"
-            items.append((img.name, label, ""))
+        w, h = img.size[0], img.size[1]
+        # Skip images too small to be UV bake targets
+        if w < 512 or h < 512:
+            continue
+        # Skip internal images
+        if img.name in {'Render Result', 'Viewer Node'}:
+            continue
+        if img.name.startswith('_bake_'):
+            continue
+        # Skip thumbnails and asset browser junk
+        name_lower = img.name.lower()
+        if name_lower.startswith('thumbnail') or 'asset_type' in name_lower:
+            continue
+        label = f"{img.name} ({w}x{h})"
+        items.append((img.name, label, ""))
     if not items:
         items = [('NONE', 'No images available', '')]
     _image_enum_items = items
