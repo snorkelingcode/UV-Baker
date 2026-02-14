@@ -46,6 +46,7 @@ def get_image_items(self, context):
             continue
         label = f"{img.name} ({w}x{h})"
         items.append((img.name, label, ""))
+    items.reverse()
     if not items:
         items = [('NONE', 'No images available', '')]
     _image_enum_items = items
@@ -158,7 +159,7 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
 
         # Create one bake target image per map
         bake_images = {}
-        for map_name in ('color', 'roughness', 'normal', 'metallic'):
+        for map_name in ('color', 'roughness', 'normal', 'emission', 'opacity', 'metallic'):
             bake_images[map_name] = bpy.data.images.new(
                 f"_bake_result_{map_name}", width=width, height=height, alpha=False,
             )
@@ -168,7 +169,7 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
         success = False
 
         try:
-            # 1/4: Color
+            # 1/6: Color
             temp_nodes = self._inject_bake_nodes(obj, bake_images['color'])
             bake = scene.render.bake
             orig_direct = bake.use_pass_direct
@@ -184,22 +185,36 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             bake.use_pass_color = orig_color
             self._remove_bake_nodes(temp_nodes)
 
-            # 2/4: Roughness
+            # 2/6: Roughness
             temp_nodes = self._inject_bake_nodes(obj, bake_images['roughness'])
-            wm.progress_update(25)
+            wm.progress_update(16)
             bpy.ops.object.bake(type='ROUGHNESS')
             self._remove_bake_nodes(temp_nodes)
 
-            # 3/4: Normal
+            # 3/6: Normal
             temp_nodes = self._inject_bake_nodes(obj, bake_images['normal'])
-            wm.progress_update(50)
+            wm.progress_update(32)
             bpy.ops.object.bake(type='NORMAL')
             self._remove_bake_nodes(temp_nodes)
 
-            # 4/4: Metallic (Emission rewire)
+            # 4/6: Emission (must bake before rewire passes)
+            temp_nodes = self._inject_bake_nodes(obj, bake_images['emission'])
+            wm.progress_update(48)
+            bpy.ops.object.bake(type='EMIT')
+            self._remove_bake_nodes(temp_nodes)
+
+            # 5/6: Opacity (Alpha → Emission rewire)
+            temp_nodes = self._inject_bake_nodes(obj, bake_images['opacity'])
+            restore_data = self._setup_opacity_rewire(obj)
+            wm.progress_update(64)
+            bpy.ops.object.bake(type='EMIT')
+            self._restore_metallic_rewire(restore_data)
+            self._remove_bake_nodes(temp_nodes)
+
+            # 6/6: Metallic (Metallic → Emission rewire)
             temp_nodes = self._inject_bake_nodes(obj, bake_images['metallic'])
             restore_data = self._setup_metallic_rewire(obj)
-            wm.progress_update(75)
+            wm.progress_update(80)
             bpy.ops.object.bake(type='EMIT')
             self._restore_metallic_rewire(restore_data)
             self._remove_bake_nodes(temp_nodes)
@@ -338,6 +353,58 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             for temp_node in restore['temp_nodes']:
                 nodes.remove(temp_node)
 
+    def _setup_opacity_rewire(self, obj):
+        restore_data = []
+        for mat_slot in obj.material_slots:
+            mat = mat_slot.material
+            if mat is None or not mat.use_nodes or mat.node_tree is None:
+                continue
+            if mat.library is not None:
+                continue
+
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            principled = None
+            for node in nodes:
+                if node.type == 'BSDF_PRINCIPLED':
+                    principled = node
+                    break
+            if principled is None:
+                continue
+
+            alpha_input = principled.inputs["Alpha"]
+            emission_color_input = principled.inputs["Emission Color"]
+            emission_strength_input = principled.inputs["Emission Strength"]
+
+            restore = {
+                'material': mat,
+                'principled': principled,
+                'emission_color_links': [
+                    link.from_socket for link in emission_color_input.links
+                ],
+                'emission_color_default': list(emission_color_input.default_value),
+                'emission_strength_value': emission_strength_input.default_value,
+                'temp_nodes': [],
+            }
+
+            for link in list(emission_color_input.links):
+                links.remove(link)
+
+            if alpha_input.is_linked:
+                source = alpha_input.links[0].from_socket
+                links.new(source, emission_color_input)
+            else:
+                val = alpha_input.default_value
+                rgb_node = nodes.new('ShaderNodeRGB')
+                rgb_node.name = "_bake_opacity_temp"
+                rgb_node.outputs[0].default_value = (val, val, val, 1.0)
+                links.new(rgb_node.outputs[0], emission_color_input)
+                restore['temp_nodes'].append(rgb_node)
+
+            emission_strength_input.default_value = 1.0
+            restore_data.append(restore)
+        return restore_data
+
 
 class OBJECT_OT_bake_materials_save(Operator):
     """Save baked PBR textures to disk"""
@@ -371,6 +438,8 @@ class OBJECT_OT_bake_materials_save(Operator):
             'Metallic': '_bake_result_metallic',
             'Roughness': '_bake_result_roughness',
             'Normal': '_bake_result_normal',
+            'Emission': '_bake_result_emission',
+            'Opacity': '_bake_result_opacity',
         }
 
         target_name = context.scene.get("_bake_target_image_name", "Texture")
@@ -413,7 +482,8 @@ def unregister():
     bpy.utils.unregister_class(OBJECT_OT_bake_materials_to_uv)
 
     for name in ['_bake_result_color', '_bake_result_metallic',
-                 '_bake_result_roughness', '_bake_result_normal']:
+                 '_bake_result_roughness', '_bake_result_normal',
+                 '_bake_result_emission', '_bake_result_opacity']:
         img = bpy.data.images.get(name)
         if img is not None:
             bpy.data.images.remove(img)
