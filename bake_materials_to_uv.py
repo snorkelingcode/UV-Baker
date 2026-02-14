@@ -143,8 +143,8 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
         original_compute_type = cycles_prefs.compute_device_type
         # Try GPU backends in order of preference
         gpu_activated = False
-        for backend in ('OPTIX', 'HIP', 'ONEAPI', 'METAL', 'CUDA'):
-            if backend in {t.value for t in cycles_prefs.get_device_type_items()}:
+        for backend in ('CUDA', 'OPTIX', 'HIP', 'ONEAPI', 'METAL'):
+            if backend in {t[0] for t in cycles_prefs.get_device_types(context)}:
                 cycles_prefs.compute_device_type = backend
                 cycles_prefs.get_devices()
                 for device in cycles_prefs.devices:
