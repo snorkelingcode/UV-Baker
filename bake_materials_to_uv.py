@@ -228,6 +228,8 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
                     bpy.data.images.remove(img)
             return {'CANCELLED'}
 
+        # Store UV layer name for the save operator
+        scene["_bake_uv_layer_name"] = self.target_uv_layer
         self.report({'INFO'}, "Bake complete! Choose where to save.")
         bpy.ops.object.bake_materials_save('INVOKE_DEFAULT')
         return {'FINISHED'}
@@ -365,17 +367,19 @@ class OBJECT_OT_bake_materials_save(Operator):
             return {'CANCELLED'}
 
         texture_map = {
-            'color': '_bake_result_color',
-            'metallic': '_bake_result_metallic',
-            'roughness': '_bake_result_roughness',
-            'normal': '_bake_result_normal',
+            'Color': '_bake_result_color',
+            'Metallic': '_bake_result_metallic',
+            'Roughness': '_bake_result_roughness',
+            'Normal': '_bake_result_normal',
         }
+
+        uv_name = context.scene.get("_bake_uv_layer_name", "UV")
 
         saved = 0
         for map_name, img_name in texture_map.items():
             img = bpy.data.images.get(img_name)
             if img is not None:
-                filepath = os.path.join(output_dir, f"{map_name}.png")
+                filepath = os.path.join(output_dir, f"TX_{uv_name}_{map_name}.png")
                 img.filepath_raw = filepath
                 img.file_format = 'PNG'
                 img.save()
