@@ -309,6 +309,19 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             if mat.node_tree is not None:
                 mat.node_tree.nodes.remove(node)
 
+    def _find_principled(self, node_tree, depth=0):
+        """Find Principled BSDF and its containing node_tree, searching inside groups."""
+        if depth > 10:
+            return None, None
+        for node in node_tree.nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                return node, node_tree
+            if node.type == 'GROUP' and node.node_tree is not None:
+                result, result_tree = self._find_principled(node.node_tree, depth + 1)
+                if result is not None:
+                    return result, result_tree
+        return None, None
+
     def _setup_rewire(self, obj, source_input_name):
         """Route a Principled BSDF input (e.g. 'Metallic', 'Alpha') to Emission for baking."""
         restore_data = []
@@ -319,22 +332,19 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             if mat.library is not None:
                 continue
 
-            nodes = mat.node_tree.nodes
-            links = mat.node_tree.links
-            principled = None
-            for node in nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    principled = node
-                    break
+            principled, containing_tree = self._find_principled(mat.node_tree)
             if principled is None:
                 continue
+
+            nodes = containing_tree.nodes
+            links = containing_tree.links
 
             source_input = principled.inputs[source_input_name]
             emission_color_input = principled.inputs["Emission Color"]
             emission_strength_input = principled.inputs["Emission Strength"]
 
             restore = {
-                'material': mat,
+                'node_tree': containing_tree,
                 'principled': principled,
                 'emission_color_links': [
                     link.from_socket for link in emission_color_input.links
@@ -368,10 +378,10 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
 
     def _restore_rewire(self, restore_data):
         for restore in restore_data:
-            mat = restore['material']
+            containing_tree = restore['node_tree']
             principled = restore['principled']
-            links = mat.node_tree.links
-            nodes = mat.node_tree.nodes
+            links = containing_tree.links
+            nodes = containing_tree.nodes
 
             emission_color_input = principled.inputs["Emission Color"]
             emission_strength_input = principled.inputs["Emission Strength"]
