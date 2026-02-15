@@ -1,6 +1,6 @@
 # Bake Materials to UV
 
-A Blender add-on that bakes PBR material channels (Color, Metallic, Roughness, Normal) from Principled BSDF materials to image textures and saves them as PNGs.
+A Blender add-on that bakes PBR materials into UE5-ready textures. Produces an optimized texture set with ORM channel packing, matching the standard Substance Painter to Unreal Engine workflow.
 
 ## Requirements
 
@@ -28,21 +28,65 @@ A Blender add-on that bakes PBR material channels (Color, Metallic, Roughness, N
 
 ## Output
 
-Four PNG files are saved to your chosen directory:
+Five PNG files are saved using UE5 naming conventions:
 
 | File | Description |
 |------|-------------|
-| `color.png` | Base color / albedo |
-| `metallic.png` | Metallic map |
-| `roughness.png` | Roughness map |
-| `normal.png` | Normal map |
+| `T_{Name}_BC.png` | Base Color (albedo) |
+| `T_{Name}_N.png` | Normal map (tangent space) |
+| `T_{Name}_ORM.png` | Packed: Ambient Occlusion (R), Roughness (G), Metallic (B) |
+| `T_{Name}_E.png` | Emissive color |
+| `T_{Name}_O.png` | Opacity (alpha) |
+
+## Importing into Unreal Engine 5
+
+### Opaque materials (wood, plastic, metal, etc.)
+
+1. Import `T_{Name}_BC`, `T_{Name}_N`, and `T_{Name}_ORM`
+2. Create a new Material, set **Blend Mode** to **Opaque** (default)
+3. Connect:
+   - `T_{Name}_BC` to **Base Color**
+   - `T_{Name}_N` to **Normal**
+   - `T_{Name}_ORM` Red channel to **Ambient Occlusion**
+   - `T_{Name}_ORM` Green channel to **Roughness**
+   - `T_{Name}_ORM` Blue channel to **Metallic**
+4. Set the ORM and Normal textures to **Linear Color** (not sRGB) in the texture asset settings
+
+**Tip:** Use a single `TextureSampleParameter2D` for the ORM texture and split channels with a **BreakOutFloat3Components** node (or just use the R/G/B output pins directly).
+
+### Translucent / glass materials
+
+1. Follow the Opaque steps above, then also import `T_{Name}_O`
+2. Change **Blend Mode** to **Translucent** (or **Masked** for binary cutouts)
+3. Connect `T_{Name}_O` to the **Opacity** input
+4. Under **Material > Translucency**, set **Lighting Mode** to **Surface ForwardShading** for best glass results
+
+### Emissive materials (lights, LEDs, screens)
+
+1. Follow the Opaque steps above, then also import `T_{Name}_E`
+2. Connect `T_{Name}_E` to the **Emissive Color** input
+3. To increase glow intensity, multiply the emissive texture by a scalar parameter before connecting
+4. Enable **Bloom** in Post Process settings to see the glow effect in-game
+
+### Which textures do I need?
+
+| UE5 Material Type | Required Textures |
+|---|---|
+| Opaque (default) | BC, N, ORM |
+| Opaque + Emissive | BC, N, ORM, E |
+| Translucent / Glass | BC, N, ORM, O |
+| Masked (cutouts) | BC, N, ORM, O |
+| Translucent + Emissive | BC, N, ORM, E, O |
 
 ## Notes
 
-- The add-on temporarily switches the render engine to Cycles for baking, then restores your original engine when done
-- Metallic is baked by routing the metallic value through the emission channel, so the bake captures the correct data even without a native metallic bake type
-- Linked/library materials are skipped during baking
-- The bake resolution is determined by the image you select in the dialog — it does not modify that image, it only reads its dimensions
+- The add-on temporarily switches to Cycles and uses GPU rendering for baking, then restores your original settings
+- All materials on the object are baked onto a single UV map (same as Substance Painter export)
+- Library-linked materials are temporarily made local for baking, then restored
+- The ORM texture packs three grayscale maps into one RGB image, reducing texture memory by 66%
+- Metallic and Opacity are baked by routing their values through the Emission channel since Blender has no native bake type for these
+- Emissive is baked before Opacity and Metallic to capture the original emission data before any rewiring
+- The bake resolution is determined by the image you select in the dialog — it does not modify that image
 
 ## License
 

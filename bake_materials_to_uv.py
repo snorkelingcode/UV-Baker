@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
+
 import bpy
 from bpy.types import Operator
 from bpy.props import (
@@ -16,10 +18,10 @@ from bpy.props import (
 bl_info = {
     "name": "Bake Materials to UV",
     "author": "Embody AI",
-    "version": (1, 0, 0),
+    "version": (2, 0, 0),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Object Context Menu",
-    "description": "Bake PBR material channels (Color, Metallic, Roughness, Normal) to UV map then save image textures on disk",
+    "description": "Bake PBR materials to UE5-ready textures (BaseColor, Normal, ORM)",
     "category": "Object",
 }
 
@@ -32,15 +34,12 @@ def get_image_items(self, context):
     items = []
     for img in bpy.data.images:
         w, h = img.size[0], img.size[1]
-        # Skip images too small to be UV bake targets
         if w < 512 or h < 512:
             continue
-        # Skip internal images
         if img.name in {'Render Result', 'Viewer Node'}:
             continue
         if img.name.startswith('_bake_'):
             continue
-        # Skip thumbnails and asset browser junk
         name_lower = img.name.lower()
         if name_lower.startswith('thumbnail') or 'asset_type' in name_lower:
             continue
@@ -67,7 +66,7 @@ def get_uv_layer_items(self, context):
 
 
 class OBJECT_OT_bake_materials_to_uv(Operator):
-    """Bake PBR material channels to UV-mapped image textures"""
+    """Bake PBR materials to UE5-ready textures (BaseColor, Normal, ORM)"""
     bl_idname = "object.bake_materials_to_uv"
     bl_label = "Bake Materials to UV"
     bl_options = {'REGISTER', 'UNDO'}
@@ -123,7 +122,7 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             if uv_layer:
                 obj.data.uv_layers.active = uv_layer
 
-        # Ensure object is selected (bake requires it)
+        # Ensure object is selected
         was_selected = obj.select_get()
         obj.select_set(True)
 
@@ -137,12 +136,10 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
         if original_engine != 'CYCLES':
             scene.render.engine = 'CYCLES'
 
-        # Force GPU rendering for bake performance
+        # Force GPU rendering
         original_device = scene.cycles.device
-        original_compute_type = None
         cycles_prefs = context.preferences.addons['cycles'].preferences
         original_compute_type = cycles_prefs.compute_device_type
-        # Try GPU backends in order of preference
         gpu_activated = False
         for backend in ('CUDA', 'OPTIX', 'HIP', 'ONEAPI', 'METAL'):
             if backend in {t[0] for t in cycles_prefs.get_device_types(context)}:
@@ -154,72 +151,83 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
                 gpu_activated = True
                 break
         if not gpu_activated:
-            # No GPU available, fall back to CPU
             scene.cycles.device = 'CPU'
 
-        # Create one bake target image per map
+        # Make library-linked materials local so we can inject bake nodes
+        original_materials = self._make_materials_local(obj)
+
+        # Create bake target images
         bake_images = {}
-        for map_name in ('color', 'roughness', 'normal', 'emission', 'opacity', 'metallic'):
-            bake_images[map_name] = bpy.data.images.new(
-                f"_bake_result_{map_name}", width=width, height=height, alpha=False,
+        for ch in ('basecolor', 'normal', 'ao', 'roughness', 'metallic',
+                    'emissive', 'opacity'):
+            bake_images[ch] = bpy.data.images.new(
+                f"_bake_{ch}", width=width, height=height, alpha=False,
             )
 
         wm = context.window_manager
-        wm.progress_begin(0, 100)
+        wm.progress_begin(0, 7)
         success = False
 
         try:
-            # 1/6: Color
-            temp_nodes = self._inject_bake_nodes(obj, bake_images['color'])
-            bake = scene.render.bake
-            orig_direct = bake.use_pass_direct
-            orig_indirect = bake.use_pass_indirect
-            orig_color = bake.use_pass_color
-            bake.use_pass_direct = False
-            bake.use_pass_indirect = False
-            bake.use_pass_color = True
+            bake_settings = scene.render.bake
+
+            # 1/7: Emissive (must bake real emission before any rewires)
+            temp_nodes = self._inject_bake_nodes(obj, bake_images['emissive'])
             wm.progress_update(0)
-            bpy.ops.object.bake(type='DIFFUSE')
-            bake.use_pass_direct = orig_direct
-            bake.use_pass_indirect = orig_indirect
-            bake.use_pass_color = orig_color
+            bpy.ops.object.bake(type='EMIT')
             self._remove_bake_nodes(temp_nodes)
 
-            # 2/6: Roughness
-            temp_nodes = self._inject_bake_nodes(obj, bake_images['roughness'])
-            wm.progress_update(16)
-            bpy.ops.object.bake(type='ROUGHNESS')
+            # 2/7: Base Color (via Emission rewire — captures raw color
+            #       regardless of transmission/alpha)
+            temp_nodes = self._inject_bake_nodes(obj, bake_images['basecolor'])
+            restore_data = self._setup_rewire(obj, "Base Color")
+            wm.progress_update(1)
+            bpy.ops.object.bake(type='EMIT')
+            self._restore_rewire(restore_data)
             self._remove_bake_nodes(temp_nodes)
 
-            # 3/6: Normal
+            # 3/7: Normal
             temp_nodes = self._inject_bake_nodes(obj, bake_images['normal'])
-            wm.progress_update(32)
+            wm.progress_update(2)
             bpy.ops.object.bake(type='NORMAL')
             self._remove_bake_nodes(temp_nodes)
 
-            # 4/6: Emission (must bake before rewire passes)
-            temp_nodes = self._inject_bake_nodes(obj, bake_images['emission'])
-            wm.progress_update(48)
-            bpy.ops.object.bake(type='EMIT')
+            # 4/7: AO
+            temp_nodes = self._inject_bake_nodes(obj, bake_images['ao'])
+            wm.progress_update(3)
+            bpy.ops.object.bake(type='AO')
             self._remove_bake_nodes(temp_nodes)
 
-            # 5/6: Opacity (Alpha → Emission rewire)
+            # 5/7: Roughness
+            temp_nodes = self._inject_bake_nodes(obj, bake_images['roughness'])
+            wm.progress_update(4)
+            bpy.ops.object.bake(type='ROUGHNESS')
+            self._remove_bake_nodes(temp_nodes)
+
+            # 6/7: Opacity (Alpha → Emission rewire)
             temp_nodes = self._inject_bake_nodes(obj, bake_images['opacity'])
-            restore_data = self._setup_opacity_rewire(obj)
-            wm.progress_update(64)
+            restore_data = self._setup_rewire(obj, "Alpha")
+            wm.progress_update(5)
             bpy.ops.object.bake(type='EMIT')
-            self._restore_metallic_rewire(restore_data)
+            self._restore_rewire(restore_data)
             self._remove_bake_nodes(temp_nodes)
 
-            # 6/6: Metallic (Metallic → Emission rewire)
+            # 7/7: Metallic (Metallic → Emission rewire)
             temp_nodes = self._inject_bake_nodes(obj, bake_images['metallic'])
-            restore_data = self._setup_metallic_rewire(obj)
-            wm.progress_update(80)
+            restore_data = self._setup_rewire(obj, "Metallic")
+            wm.progress_update(6)
             bpy.ops.object.bake(type='EMIT')
-            self._restore_metallic_rewire(restore_data)
+            self._restore_rewire(restore_data)
             self._remove_bake_nodes(temp_nodes)
 
-            wm.progress_update(100)
+            # Pack ORM texture: AO(R) + Roughness(G) + Metallic(B)
+            orm_img = self._pack_orm(
+                bake_images['ao'], bake_images['roughness'],
+                bake_images['metallic'], width, height,
+            )
+            bake_images['orm'] = orm_img
+
+            wm.progress_update(7)
             success = True
 
         except Exception as e:
@@ -227,15 +235,20 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
 
         finally:
             wm.progress_end()
-            # Restore original render device settings
+            self._restore_original_materials(obj, original_materials)
             scene.cycles.device = original_device
-            if original_compute_type is not None:
-                cycles_prefs.compute_device_type = original_compute_type
+            cycles_prefs.compute_device_type = original_compute_type
             scene.render.engine = original_engine
             if obj.mode != original_mode:
                 bpy.ops.object.mode_set(mode=original_mode)
             if not was_selected:
                 obj.select_set(False)
+
+        # Clean up intermediate images (AO, Roughness, Metallic) — only ORM is saved
+        for ch in ('ao', 'roughness', 'metallic'):
+            img = bake_images.get(ch)
+            if img and img.name in [i.name for i in bpy.data.images]:
+                bpy.data.images.remove(img)
 
         if not success:
             for img in bake_images.values():
@@ -243,7 +256,6 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
                     bpy.data.images.remove(img)
             return {'CANCELLED'}
 
-        # Store target image name for the save operator
         scene["_bake_target_image_name"] = self.target_image
         self.report({'INFO'}, "Bake complete! Choose where to save.")
         bpy.ops.object.bake_materials_save('INVOKE_DEFAULT')
@@ -252,6 +264,23 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _make_materials_local(self, obj):
+        original_materials = {}
+        for idx, mat_slot in enumerate(obj.material_slots):
+            mat = mat_slot.material
+            if mat is not None and mat.library is not None:
+                local_mat = mat.copy()
+                original_materials[idx] = mat
+                obj.material_slots[idx].material = local_mat
+        return original_materials
+
+    def _restore_original_materials(self, obj, original_materials):
+        for idx, original_mat in original_materials.items():
+            local_mat = obj.material_slots[idx].material
+            obj.material_slots[idx].material = original_mat
+            if local_mat is not None and local_mat.users == 0:
+                bpy.data.materials.remove(local_mat)
 
     def _inject_bake_nodes(self, obj, bake_image):
         temp_nodes = []
@@ -280,7 +309,8 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             if mat.node_tree is not None:
                 mat.node_tree.nodes.remove(node)
 
-    def _setup_metallic_rewire(self, obj):
+    def _setup_rewire(self, obj, source_input_name):
+        """Route a Principled BSDF input (e.g. 'Metallic', 'Alpha') to Emission for baking."""
         restore_data = []
         for mat_slot in obj.material_slots:
             mat = mat_slot.material
@@ -299,7 +329,7 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             if principled is None:
                 continue
 
-            metallic_input = principled.inputs["Metallic"]
+            source_input = principled.inputs[source_input_name]
             emission_color_input = principled.inputs["Emission Color"]
             emission_strength_input = principled.inputs["Emission Strength"]
 
@@ -317,14 +347,18 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             for link in list(emission_color_input.links):
                 links.remove(link)
 
-            if metallic_input.is_linked:
-                source = metallic_input.links[0].from_socket
+            if source_input.is_linked:
+                source = source_input.links[0].from_socket
                 links.new(source, emission_color_input)
             else:
-                val = metallic_input.default_value
+                val = source_input.default_value
                 rgb_node = nodes.new('ShaderNodeRGB')
-                rgb_node.name = "_bake_metallic_temp"
-                rgb_node.outputs[0].default_value = (val, val, val, 1.0)
+                rgb_node.name = f"_bake_{source_input_name}_temp"
+                # Handle both color (RGBA) and scalar inputs
+                if hasattr(val, '__len__'):
+                    rgb_node.outputs[0].default_value = (val[0], val[1], val[2], 1.0)
+                else:
+                    rgb_node.outputs[0].default_value = (val, val, val, 1.0)
                 links.new(rgb_node.outputs[0], emission_color_input)
                 restore['temp_nodes'].append(rgb_node)
 
@@ -332,7 +366,7 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             restore_data.append(restore)
         return restore_data
 
-    def _restore_metallic_rewire(self, restore_data):
+    def _restore_rewire(self, restore_data):
         for restore in restore_data:
             mat = restore['material']
             principled = restore['principled']
@@ -353,61 +387,25 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             for temp_node in restore['temp_nodes']:
                 nodes.remove(temp_node)
 
-    def _setup_opacity_rewire(self, obj):
-        restore_data = []
-        for mat_slot in obj.material_slots:
-            mat = mat_slot.material
-            if mat is None or not mat.use_nodes or mat.node_tree is None:
-                continue
-            if mat.library is not None:
-                continue
+    def _pack_orm(self, ao_img, rough_img, metal_img, width, height):
+        """Pack AO(R), Roughness(G), Metallic(B) into a single ORM texture."""
+        ao = np.array(ao_img.pixels[:]).reshape(-1, 4)
+        rough = np.array(rough_img.pixels[:]).reshape(-1, 4)
+        metal = np.array(metal_img.pixels[:]).reshape(-1, 4)
 
-            nodes = mat.node_tree.nodes
-            links = mat.node_tree.links
-            principled = None
-            for node in nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    principled = node
-                    break
-            if principled is None:
-                continue
+        orm = np.ones((width * height, 4), dtype=np.float32)
+        orm[:, 0] = ao[:, 0]       # R = Ambient Occlusion
+        orm[:, 1] = rough[:, 0]    # G = Roughness
+        orm[:, 2] = metal[:, 0]    # B = Metallic
+        orm[:, 3] = 1.0            # A = 1.0
 
-            alpha_input = principled.inputs["Alpha"]
-            emission_color_input = principled.inputs["Emission Color"]
-            emission_strength_input = principled.inputs["Emission Strength"]
-
-            restore = {
-                'material': mat,
-                'principled': principled,
-                'emission_color_links': [
-                    link.from_socket for link in emission_color_input.links
-                ],
-                'emission_color_default': list(emission_color_input.default_value),
-                'emission_strength_value': emission_strength_input.default_value,
-                'temp_nodes': [],
-            }
-
-            for link in list(emission_color_input.links):
-                links.remove(link)
-
-            if alpha_input.is_linked:
-                source = alpha_input.links[0].from_socket
-                links.new(source, emission_color_input)
-            else:
-                val = alpha_input.default_value
-                rgb_node = nodes.new('ShaderNodeRGB')
-                rgb_node.name = "_bake_opacity_temp"
-                rgb_node.outputs[0].default_value = (val, val, val, 1.0)
-                links.new(rgb_node.outputs[0], emission_color_input)
-                restore['temp_nodes'].append(rgb_node)
-
-            emission_strength_input.default_value = 1.0
-            restore_data.append(restore)
-        return restore_data
+        orm_img = bpy.data.images.new("_bake_orm", width=width, height=height, alpha=False)
+        orm_img.pixels = orm.flatten().tolist()
+        return orm_img
 
 
 class OBJECT_OT_bake_materials_save(Operator):
-    """Save baked PBR textures to disk"""
+    """Save baked UE5 textures to disk"""
     bl_idname = "object.bake_materials_save"
     bl_label = "Save Baked Textures"
     bl_options = {'REGISTER'}
@@ -420,7 +418,7 @@ class OBJECT_OT_bake_materials_save(Operator):
 
     @classmethod
     def poll(cls, context):
-        return bpy.data.images.get("_bake_result_color") is not None
+        return bpy.data.images.get("_bake_basecolor") is not None
 
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
@@ -433,22 +431,21 @@ class OBJECT_OT_bake_materials_save(Operator):
             self.report({'ERROR'}, "Output directory does not exist")
             return {'CANCELLED'}
 
-        texture_map = {
-            'Color': '_bake_result_color',
-            'Metallic': '_bake_result_metallic',
-            'Roughness': '_bake_result_roughness',
-            'Normal': '_bake_result_normal',
-            'Emission': '_bake_result_emission',
-            'Opacity': '_bake_result_opacity',
-        }
-
         target_name = context.scene.get("_bake_target_image_name", "Texture")
 
+        texture_map = {
+            'BC': '_bake_basecolor',
+            'N': '_bake_normal',
+            'ORM': '_bake_orm',
+            'E': '_bake_emissive',
+            'O': '_bake_opacity',
+        }
+
         saved = 0
-        for map_name, img_name in texture_map.items():
+        for suffix, img_name in texture_map.items():
             img = bpy.data.images.get(img_name)
             if img is not None:
-                filepath = os.path.join(output_dir, f"TX_{target_name}_{map_name}.png")
+                filepath = os.path.join(output_dir, f"T_{target_name}_{suffix}.png")
                 img.filepath_raw = filepath
                 img.file_format = 'PNG'
                 img.save()
@@ -481,11 +478,8 @@ def unregister():
     bpy.utils.unregister_class(OBJECT_OT_bake_materials_save)
     bpy.utils.unregister_class(OBJECT_OT_bake_materials_to_uv)
 
-    for name in ['_bake_result_color', '_bake_result_metallic',
-                 '_bake_result_roughness', '_bake_result_normal',
-                 '_bake_result_emission', '_bake_result_opacity']:
-        img = bpy.data.images.get(name)
-        if img is not None:
+    for img in list(bpy.data.images):
+        if img.name.startswith('_bake_'):
             bpy.data.images.remove(img)
 
 
