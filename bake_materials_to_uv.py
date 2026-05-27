@@ -244,16 +244,15 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             if not was_selected:
                 obj.select_set(False)
 
-        # Clean up intermediate images (AO, Roughness, Metallic) — only ORM is saved
+        # Clean up intermediate images (AO, Roughness, Metallic) — only ORM is saved.
+        # pop() removes them from bake_images so the failure cleanup below can't
+        # touch a datablock we've already deleted (stale StructRNA references).
         for ch in ('ao', 'roughness', 'metallic'):
-            img = bake_images.get(ch)
-            if img and img.name in [i.name for i in bpy.data.images]:
-                bpy.data.images.remove(img)
+            self._safe_remove_image(bake_images.pop(ch, None))
 
         if not success:
-            for img in bake_images.values():
-                if img.name in [i.name for i in bpy.data.images]:
-                    bpy.data.images.remove(img)
+            for img in list(bake_images.values()):
+                self._safe_remove_image(img)
             return {'CANCELLED'}
 
         scene["_bake_target_image_name"] = self.target_image
@@ -264,6 +263,23 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _safe_remove_image(img):
+        """Remove an Image datablock, tolerating None and already-removed refs.
+
+        Blender invalidates the underlying StructRNA when a datablock is freed,
+        so a Python reference held in our dict can go stale (e.g. if the file
+        was reloaded, or we deleted it earlier). Accessing any attribute on a
+        dead reference raises ReferenceError, so we guard the whole operation.
+        """
+        if img is None:
+            return
+        try:
+            if img.name in bpy.data.images:
+                bpy.data.images.remove(img)
+        except ReferenceError:
+            pass  # datablock already gone — nothing to clean up
 
     def _make_materials_local(self, obj):
         original_materials = {}
@@ -325,6 +341,7 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
     def _setup_rewire(self, obj, source_input_name):
         """Route a Principled BSDF input (e.g. 'Metallic', 'Alpha') to Emission for baking."""
         restore_data = []
+        seen_principled = set()
         for mat_slot in obj.material_slots:
             mat = mat_slot.material
             if mat is None or not mat.use_nodes or mat.node_tree is None:
@@ -335,6 +352,12 @@ class OBJECT_OT_bake_materials_to_uv(Operator):
             principled, containing_tree = self._find_principled(mat.node_tree)
             if principled is None:
                 continue
+
+            # Skip if we already rewired this node (shared node groups)
+            node_ptr = principled.as_pointer()
+            if node_ptr in seen_principled:
+                continue
+            seen_principled.add(node_ptr)
 
             nodes = containing_tree.nodes
             links = containing_tree.links
